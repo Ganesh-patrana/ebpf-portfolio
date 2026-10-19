@@ -1,0 +1,8 @@
+#!/usr/bin/env bpftrace
+/*
+ * Traces every new process execution on the system.
+ */
+tracepoint:syscalls:sys_enter_execve
+{
+    printf("PID: %-6d | Comm: %-15s\n", pid, comm);
+}
