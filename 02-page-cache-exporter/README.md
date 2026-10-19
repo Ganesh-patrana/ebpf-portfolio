@@ -1,2 +1,2 @@
-# Phase 3: Kubernetes-Enriched eBPF Exporter
-This project couples kernel-level tracing with Kubernetes metadata. It attaches an eBPF kprobe (`mark_page_accessed`) to count page cache hits per process in an eBPF hash map, then uses Go (`client-go`) to map raw PIDs to active Kubernetes Pods and Namespaces.
+# Phase 4: Prometheus Telemetry Integration
+Exposes the Kubernetes-enriched eBPF metrics over an HTTP `/metrics` endpoint using `client_golang`, making the kernel-level data scrapable by standard cloud-native monitoring stacks.

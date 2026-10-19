@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,20 +14,33 @@ import (
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
 
-// getContainerID attempts to extract the container ID from a process's cgroup file.
+var (
+	pageCacheHits = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ebpf_page_cache_hits_total",
+			Help: "Total number of page cache hits captured via eBPF kprobe",
+		},
+		[]string{"pid", "pod_name"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(pageCacheHits)
+}
+
 func getContainerID(pid uint32) string {
 	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
 	if err != nil {
 		return ""
 	}
-	
-	// Scan for containerd or docker signatures in the cgroup path
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.Contains(line, "containerd-") || strings.Contains(line, "docker-") || strings.Contains(line, "cri-containerd:") {
 			parts := strings.Split(line, "/")
@@ -43,7 +57,6 @@ func getContainerID(pid uint32) string {
 }
 
 func main() {
-	// 1. Initialize Kubernetes Client
 	kubeconfig := filepath.Join(homedir.HomeDir(), ".kube", "config")
 	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
 	if err != nil {
@@ -54,7 +67,6 @@ func main() {
 		log.Fatalf("Failed to create K8s client: %v", err)
 	}
 
-	// 2. Load eBPF Programs
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatalf("Failed to remove memlock: %v", err)
 	}
@@ -70,24 +82,30 @@ func main() {
 	}
 	defer kp.Close()
 
-	fmt.Println("eBPF K8s Exporter Running. Monitoring page cache hits...")
+	// Start Prometheus metrics endpoint in the background
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Println("Serving Prometheus metrics at :2112/metrics")
+		if err := http.ListenAndServe(":2112", nil); err != nil {
+			log.Fatalf("Metrics server error: %v", err)
+		}
+	}()
 
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
+	// Track previous hits per PID to compute delta additions to Prometheus Counter
+	lastHits := make(map[uint32]uint64)
+
 	for range ticker.C {
-		// Fetch current pods from the cluster
 		pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
-			fmt.Printf("Error fetching pods: %v\n", err)
 			continue
 		}
 
-		// Create a map of Container ID -> Pod Name
 		containerToPod := make(map[string]string)
 		for _, pod := range pods.Items {
 			for _, status := range pod.Status.ContainerStatuses {
-				// K8s returns IDs like "containerd://<hex_id>"
 				cleanID := strings.TrimPrefix(status.ContainerID, "containerd://")
 				containerToPod[cleanID] = pod.Name
 			}
@@ -96,21 +114,22 @@ func main() {
 		var pid uint32
 		var hits uint64
 		iter := objs.CacheHits.Iterate()
-		
-		fmt.Printf("\n--- Page Cache Hits (K8s Enriched) ---\n")
+
 		for iter.Next(&pid, &hits) {
-			if hits > 50 {
+			if hits > lastHits[pid] {
+				delta := hits - lastHits[pid]
+				lastHits[pid] = hits
+
 				cID := getContainerID(pid)
-				podName := "Host/System"
-				
-				// Check if the eBPF container ID matches any running K8s Pod
+				podName := "system"
 				for k8sID, name := range containerToPod {
 					if cID != "" && strings.Contains(cID, k8sID) {
 						podName = name
 						break
 					}
 				}
-				fmt.Printf("PID: %-6d | Pod: %-15s | Cache Hits: %d\n", pid, podName, hits)
+
+				pageCacheHits.WithLabelValues(fmt.Sprintf("%d", pid), podName).Add(float64(delta))
 			}
 		}
 	}
