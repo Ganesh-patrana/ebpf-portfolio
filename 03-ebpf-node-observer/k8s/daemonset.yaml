@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-node-observer
+  namespace: kube-system
+  labels:
+    app: ebpf-node-observer
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-node-observer
+  template:
+    metadata:
+      labels:
+        app: ebpf-node-observer
+    spec:
+      # eBPF agents need to see the host's process tree and network
+      hostPID: true
+      hostNetwork: true
+      containers:
+      - name: ebpf-agent
+        image: ebpf-node-observer:v1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          # Critical: eBPF requires root privileges to load bytecode into the kernel
+          privileged: true
+        ports:
+        - containerPort: 8080
+          hostPort: 8080
+          name: metrics
+        volumeMounts:
+        - name: sys-fs-bpf
+          mountPath: /sys/fs/bpf
+          mountPropagation: Bidirectional
+      volumes:
+      - name: sys-fs-bpf
+        hostPath:
+          path: /sys/fs/bpf
+          type: DirectoryOrCreate
